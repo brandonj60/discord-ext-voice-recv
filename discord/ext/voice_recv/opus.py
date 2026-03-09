@@ -60,6 +60,7 @@ class PacketDecoder:
         self._cached_id: Optional[int] = None
 
         self.vc: VoiceRecvClient = self.sink.voice_client  # type: ignore
+        self.vc._connection.dave_session.set_passthrough_mode(True, 10)
 
         self._last_seq: int = -1
         self._last_ts: int = -1
