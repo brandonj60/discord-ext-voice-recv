@@ -108,7 +108,10 @@ class PacketRouter(threading.Thread):
             self.waiter.wait()
             with self._lock:
                 for decoder in self.waiter.items:
-                    data = decoder.pop_data()
+                    try:
+                        data = decoder.pop_data()
+                    except Exception as e:
+                        continue
                     if data is not None:
                         self.sink.write(data.source, data)
 
