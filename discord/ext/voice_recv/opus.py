@@ -11,7 +11,12 @@ from .rtp import FakePacket
 from .utils import add_wrapped
 
 from discord.opus import Decoder
-from davey import MediaType
+
+try:
+    from davey import MediaType
+    has_dave = True
+except ImportError:
+    has_dave = False
 
 if TYPE_CHECKING:
     from typing import Optional, Tuple, Dict, Callable, Any
@@ -41,7 +46,6 @@ class VoiceData:
         self.source: Optional[User] = source
         self.pcm: bytes = pcm if pcm else b''
 
-    @property
     def opus(self) -> Optional[bytes]:
         return self.packet.decrypted_data
 
@@ -55,9 +59,7 @@ class PacketDecoder:
         self._buffer: JitterBuffer = JitterBuffer()
         self._cached_id: Optional[int] = None
 
-        self.vc: VoiceRecvClient = self.sink.voice_client
-        self.vc._connection.dave_session.set_passthrough_mode(True, 10)
-
+        self.vc: VoiceRecvClient = self.sink.voice_client  # type: ignore
 
         self._last_seq: int = -1
         self._last_ts: int = -1
@@ -136,8 +138,6 @@ class PacketDecoder:
 
     def _process_packet(self, packet: AudioPacket) -> VoiceData:
         pcm = None
-        if not self.sink.wants_opus():
-            packet, pcm = self._decode_packet(packet)
 
         member = self._get_cached_member()
 
@@ -145,12 +145,14 @@ class PacketDecoder:
             self._cached_id = self.sink.voice_client._get_id_from_ssrc(self.ssrc)  # type: ignore
             member = self._get_cached_member()
 
-        #DAVE Decrypt
-        packet.decrypted_data = self.vc._connection.dave_session.decrypt(member.id, MediaType.audio, bytes(packet.decrypted_data))
+        if has_dave and not packet.is_silence() and packet.decrypted_data is not None and self.vc._connection.dave_session is not None and self.vc._connection.dave_session.ready:
+            try:
+                packet.decrypted_data = self.vc._connection.dave_session.decrypt(member.id, MediaType.audio, packet.decrypted_data)  # type: ignore
+            except Exception as e:
+                log.debug(f"DAVE decryption failed (packet may already be plain): {e}")
 
         if not self.sink.wants_opus():
             packet, pcm = self._decode_packet(packet)
-
 
         data = VoiceData(packet, member, pcm=pcm)
         self._last_seq = packet.sequence
