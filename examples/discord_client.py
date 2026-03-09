@@ -9,7 +9,7 @@ import subprocess
 import aiohttp
 import numpy as np
 import sphn, discord
-from discordtest import listening
+from discord.ext import voice_recv
 import sounddevice as sd
 import io
 import wave
@@ -32,21 +32,7 @@ logging.basicConfig(
 logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.voice").setLevel(logging.DEBUG)
 logging.getLogger("discord.gateway").setLevel(logging.INFO)
-logging.getLogger("discord.ext.listening").setLevel(logging.DEBUG)
-
-class PatchedListeningVoiceClient(listening.VoiceClient):
-    def __init__(self, client, channel):
-        super().__init__(client, channel)
-
-        # If discord.py doesn't expose VoiceClient._connected but does have it on
-        # its internal voice connection state, alias it.
-        if not hasattr(self, "_connected"):
-            conn = getattr(self, "_connection", None)
-            ev = getattr(conn, "_connected", None)
-            if ev is None:
-                ev = threading.Event()
-                ev.set()
-            self._connected = ev
+logging.getLogger("discord.ext.voice_recv").setLevel(logging.DEBUG)
 
 def convert_opus_to_pcm(pcm_data, input_rate=24000, output_rate=48000, output_type="int16"):
     # Resample the PCM data from 24kHz to 48kHz
@@ -110,8 +96,6 @@ class DiscordAudioHandler(discord.Client):
         self._voice_done = False
         self._connected = asyncio.Event()
         self.listen_task = None
-        self._process_pool = listening.AudioProcessPool(1)
-        
         self._opus_writer = sphn.OpusStreamWriter(sample_rate)
         self._opus_reader = sphn.OpusStreamReader(sample_rate)
         self._send_queue = asyncio.Queue()
@@ -120,17 +104,18 @@ class DiscordAudioHandler(discord.Client):
         self._tasks = []      # Track tasks for cancellation
             
     # Custom AudioSink to capture audio
-    class AudioBufferSink(listening.AudioSink):
+    class AudioBufferSink(voice_recv.AudioSink):
         """
-        Receives decoded PCM frames from discord-ext-listening and pushes 24kHz mono float32
+        Receives decoded PCM frames from discord-ext-voice-recv and pushes 24kHz mono float32
         into your sphn.OpusStreamWriter via _opus_writer.append_pcm(...).
 
         Notes:
-        - discord-ext-listening's AudioFrame.audio is decoded PCM bytes (s16le).
+        - discord-ext-voice-recv exposes decoded PCM data via VoiceData.pcm (s16le).
         - Discord receive is typically 48kHz stereo s16le.
         """
 
         def __init__(self, _opus_writer, frame_size: int, channels: int):
+            super().__init__()
             self._opus_writer = _opus_writer
             self.frame_size = frame_size
             self.channels = channels
@@ -152,13 +137,19 @@ class DiscordAudioHandler(discord.Client):
 
             self._min_packet_bytes = 100  # keep your old "ignore tiny packets" behavior
 
-        def on_audio(self, frame: listening.AudioFrame):
-            try:
-                audio_data = frame.audio
-                # If you had a print after reading frame.audio, put it here:
-                print("on_audio got bytes:", len(audio_data))
+        def wants_opus(self) -> bool:
+            return False
 
-                if not audio_data or len(audio_data) < self._min_packet_bytes:
+        def write(self, user, data):
+            try:
+                audio_data = data.pcm
+                if not audio_data:
+                    return
+
+                # If you had a print after reading PCM data, put it here:
+                print("write got bytes:", len(audio_data))
+
+                if len(audio_data) < self._min_packet_bytes:
                     return
 
                 chunks = []
@@ -186,7 +177,7 @@ class DiscordAudioHandler(discord.Client):
                     self._opus_writer.append_pcm(in_data_float32)
 
             except Exception as e:
-                print(f"AudioBufferSink.on_audio error: {e}")
+                print(f"AudioBufferSink.write error: {e}")
 
         def on_rtcp(self, packet):
             # You can ignore RTCP unless you need timing / SSRC events.
@@ -425,7 +416,7 @@ class DiscordAudioHandler(discord.Client):
 
             try:
                 await asyncio.sleep(1)
-                vc = await after.channel.connect(cls=PatchedListeningVoiceClient,reconnect=False,self_deaf=False,self_mute=False)
+                vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient,reconnect=False,self_deaf=False,self_mute=False)
                 print("negotiated voice mode:", getattr(vc, "mode", None))
             except asyncio.TimeoutError:
                 print("Failed to connect: timed out.")
@@ -435,7 +426,7 @@ class DiscordAudioHandler(discord.Client):
                 print("Opus library not loaded. Cannot connect to voice.")
             if not vc.is_connected():
                 print("Failed to connect. Retrying")
-                vc = await after.channel.connect(cls=PatchedListeningVoiceClient,reconnect=False,self_deaf=False,self_mute=False)
+                vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient,reconnect=False,self_deaf=False,self_mute=False)
             await self._send_queue.put((5, member.name.encode("utf-8")))
             self._voice_done = False  # Reset shutdown flag
             self.listen_task = asyncio.create_task(self.start_listening(vc))
@@ -481,7 +472,6 @@ class DiscordAudioHandler(discord.Client):
 
         voice_client.listen(
             sink,
-            self._process_pool,
             after=self.on_listening_stopped
         )
 
@@ -520,11 +510,7 @@ class DiscordAudioHandler(discord.Client):
             task.cancel()
         if self._session:
             await self._session.close()
-        try:
-            if getattr(self, "_process_pool", None) is not None:
-                self._process_pool.cleanup_processes()
-        finally:
-            await super().close()
+        await super().close()
     
 async def runApp(printer: AnyPrinter, args, intents, token):
     if args.url is None:
